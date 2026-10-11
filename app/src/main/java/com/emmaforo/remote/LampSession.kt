@@ -24,6 +24,8 @@ import kotlin.coroutines.resume
 import kotlin.math.roundToInt
 import androidx.glance.appwidget.updateAll
 
+private const val FIRMWARE_NOTE_URL = "https://emmaforo.michelebigi.it/firmware/version.txt"
+
 class LampSession(private val app: Context) {
     val store = LampStore(app)
     val ble = BleLink(app, this)
@@ -42,8 +44,6 @@ class LampSession(private val app: Context) {
     var ready by mutableStateOf(false)
         private set
     var outOfRange by mutableStateOf(false)
-        private set
-    var wifiUp by mutableStateOf(false)
         private set
     var resting by mutableStateOf(false)
         private set
@@ -89,6 +89,19 @@ class LampSession(private val app: Context) {
     var hasChargeReport by mutableStateOf(false)
         private set
     var confirmRest by mutableStateOf(false)
+    var confirmFirmware by mutableStateOf(false)
+    var firmwareVersion by mutableStateOf("")
+        private set
+    var offeredFirmware by mutableStateOf("")
+        private set
+    var firmwareUpdating by mutableStateOf(false)
+        private set
+    var firmwareResult by mutableStateOf<String?>(null)
+        private set
+    private var awaitedFirmware: String? = null
+    private var firmwareApprovedAt = 0L
+    private var firmwareNoteFetchedAt = 0L
+    private var firmwareReconnect: Runnable? = null
     var tab by mutableIntStateOf(0)
     private var editingSlotId: String? = null
     private var lastBlink = false
@@ -100,7 +113,6 @@ class LampSession(private val app: Context) {
         get() = when {
             resting -> "In riposo"
             ready -> "Connesso"
-            wifiUp -> "Connesso via WiFi"
             outOfRange -> "Fuori portata"
             else -> status
         }
@@ -144,6 +156,7 @@ class LampSession(private val app: Context) {
     }
 
     fun start() {
+        if (firmwareReconnect != null) return
         connectionRequested = true
         if (!hasBlePermission()) {
             ready = false
@@ -236,8 +249,6 @@ class LampSession(private val app: Context) {
         val first = fields.firstOrNull() ?: return
         if (first == "0" || first == "1") {
             connectedNetworkName = fields.getOrNull(1) ?: ""
-            val ip = fields.getOrNull(2).orEmpty()
-            if (ip.isNotEmpty()) store.stationUrl = "http://$ip"
             boardHasPassword = fields.getOrNull(3) == "1"
             hasWifiStatus = true
             savedNetwork = if (connectedNetworkName.isEmpty()) "Nessuna" else connectedNetworkName
@@ -255,6 +266,108 @@ class LampSession(private val app: Context) {
 
     fun applySerial(serial: String) {
         serialNumber = serial
+    }
+
+    fun applyFirmwareVersion(version: String) {
+        firmwareVersion = version
+        val awaited = awaitedFirmware ?: return
+        when {
+            version == awaited -> {
+                firmwareResult = "Firmware aggiornato a $awaited."
+                awaitedFirmware = null
+                firmwareUpdating = false
+            }
+            System.currentTimeMillis() - firmwareApprovedAt > 360_000 -> {
+                firmwareResult = "Il firmware non è stato aggiornato. Controlla la rete Wi‑Fi salvata e riprova."
+                awaitedFirmware = null
+                firmwareUpdating = false
+            }
+            else -> {
+                // Still downloading: leave the lamp alone a little longer.
+                firmwareUpdating = true
+                stayQuietForFirmware(60_000)
+            }
+        }
+    }
+
+    /** First line of the version note next to the published image. */
+    fun refreshFirmwareNote() {
+        val now = System.currentTimeMillis()
+        if (now - firmwareNoteFetchedAt < 15_000) return
+        firmwareNoteFetchedAt = now
+        scope.launch(Dispatchers.IO) {
+            val note = runCatching {
+                val connection = java.net.URL(FIRMWARE_NOTE_URL).openConnection() as java.net.HttpURLConnection
+                connection.connectTimeout = 8000
+                connection.readTimeout = 8000
+                try {
+                    if (connection.responseCode != 200) null
+                    else connection.inputStream.bufferedReader().readLine()?.trim()
+                } finally {
+                    connection.disconnect()
+                }
+            }.getOrNull()
+            withContext(Dispatchers.Main) {
+                if (note == null) firmwareNoteFetchedAt = 0 else offeredFirmware = note
+            }
+        }
+    }
+
+    val newerFirmware: String?
+        get() {
+            val offered = versionParts(offeredFirmware) ?: return null
+            val running = versionParts(firmwareVersion) ?: return null
+            for (index in 0 until maxOf(offered.size, running.size)) {
+                val left = offered.getOrElse(index) { 0 }
+                val right = running.getOrElse(index) { 0 }
+                if (left > right) return offeredFirmware
+                if (left < right) return null
+            }
+            return null
+        }
+
+    /** A saved network is needed: the lamp uses Wi-Fi only for this download. */
+    val updateNeedsNetwork: Boolean get() = hasWifiStatus && connectedNetworkName.isEmpty()
+
+    fun approveFirmware() {
+        val version = newerFirmware ?: return
+        if (!ble.approveFirmware(version)) {
+            status = "Collega prima EmmaForo"
+            return
+        }
+        firmwareUpdating = true
+        firmwareResult = null
+        awaitedFirmware = version
+        firmwareApprovedAt = System.currentTimeMillis()
+        status = "Confermo il firmware…"
+    }
+
+    fun onFirmwareApproved() {
+        stayQuietForFirmware(120_000)
+    }
+
+    fun onFirmwareApproveFailed() {
+        firmwareUpdating = false
+        awaitedFirmware = null
+        status = "Errore conferma firmware"
+    }
+
+    private fun stayQuietForFirmware(millis: Long) {
+        connectionRequested = false
+        firmwareReconnect?.let { main.removeCallbacks(it) }
+        ble.release()
+        val reconnect = Runnable {
+            firmwareReconnect = null
+            start()
+        }
+        firmwareReconnect = reconnect
+        main.postDelayed(reconnect, millis)
+    }
+
+    private fun versionParts(text: String): List<Int>? {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return null
+        return trimmed.split('.').map { piece -> piece.toIntOrNull() ?: return null }
     }
 
     fun applySafe(enabled: Boolean) {
@@ -422,7 +535,6 @@ class LampSession(private val app: Context) {
     fun forgetNetwork() {
         wifiSsid = ""
         wifiPassword = ""
-        store.stationUrl = ""
         ble.forgetNetwork()
         connectedNetworkName = ""
         boardHasPassword = false
@@ -462,7 +574,7 @@ class LampSession(private val app: Context) {
 
     fun openPowerTab() {
         if (ready) ble.readPower()
-        else if (wifiUp && store.stationUrl.isNotEmpty()) refreshBattery()
+        refreshFirmwareNote()
     }
 
     var widgetSend = false
@@ -630,47 +742,9 @@ class LampSession(private val app: Context) {
             ble.setLed(command, blinkOn, brightnessByte())
             return
         }
+        // Bluetooth only: the command goes out as soon as the lamp is reachable.
         pending = command to blinkOn
-        if (outOfRange) {
-            ble.yield()
-            deliverPending()
-            return
-        }
         start()
-    }
-
-    private fun deliverPending() {
-        remoteJob?.cancel()
-        remoteJob = scope.launch(Dispatchers.IO) {
-            repeat(4) {
-                if (ble.ready) return@launch
-                val waiting = pending
-                if (waiting != null) {
-                    val endpoint = WifiLink.send(store, waiting.first, waiting.second, brightnessByte())
-                    if (endpoint != null) {
-                        withContext(Dispatchers.Main) {
-                            wifiUp = true
-                            pending = null
-                            status = "Connesso via WiFi"
-                        }
-                        return@launch
-                    }
-                } else {
-                    val endpoint = WifiLink.resolve(store)
-                    if (endpoint != null) {
-                        withContext(Dispatchers.Main) {
-                            wifiUp = true
-                            status = "Connesso via WiFi"
-                        }
-                        return@launch
-                    }
-                }
-                delay(3_000)
-            }
-            withContext(Dispatchers.Main) {
-                if (!ble.ready) wifiUp = false
-            }
-        }
     }
 
     private suspend fun deliver(command: String, blinkOn: Boolean, levelByte: Int): Boolean {
@@ -689,25 +763,7 @@ class LampSession(private val app: Context) {
                 return true
             }
         }
-        val endpoint = withContext(Dispatchers.IO) { WifiLink.send(store, command, blinkOn, levelByte) }
-        if (endpoint != null) {
-            withContext(Dispatchers.Main) {
-                wifiUp = true
-                outOfRange = true
-                if (!ble.ready) status = "Connesso via WiFi"
-            }
-            return true
-        }
         return false
-    }
-
-    private fun refreshBattery() {
-        val endpoint = store.stationUrl
-        if (endpoint.isEmpty()) return
-        scope.launch(Dispatchers.IO) {
-            val reading = WifiLink.battery(endpoint) ?: return@launch
-            withContext(Dispatchers.Main) { battery = reading }
-        }
     }
 
     private fun refreshWidget() {
@@ -725,7 +781,6 @@ class LampSession(private val app: Context) {
                 ready = false
                 outOfRange = true
                 status = "Fuori portata"
-                deliverPending()
             }
         }
         searchTimeout = timeout

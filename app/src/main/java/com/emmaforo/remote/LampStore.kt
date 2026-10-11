@@ -7,10 +7,6 @@ import org.json.JSONObject
 class LampStore(context: Context) {
     private val prefs = context.getSharedPreferences("emmaforo", Context.MODE_PRIVATE)
 
-    var stationUrl: String
-        get() = prefs.getString("stationURL", "") ?: ""
-        set(value) = prefs.edit().putString("stationURL", value).apply()
-
     var lightLevel: Int
         get() = prefs.getInt("lightLevel", 100)
         set(value) = prefs.edit().putInt("lightLevel", value.coerceIn(0, 100)).apply()

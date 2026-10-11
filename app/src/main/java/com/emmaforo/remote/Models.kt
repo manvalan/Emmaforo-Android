@@ -78,8 +78,8 @@ fun chargerNotice(
     valid: Boolean,
 ): String {
     if (fault == 0) {
-        val holding = safeCharging && !chargePaused && valid && percent != null && percent >= 95 && !charging
-        return if (holding) "Ricarica sicura: in pausa al 95%." else "Nessun guasto"
+        val holding = safeCharging && !chargePaused && valid && percent != null && percent >= 90 && !charging
+        return if (holding) "Ricarica sicura: in pausa intorno al 90%." else "Nessun guasto"
     }
     if (fault and 0x08 != 0) return "La tensione della batteria è troppo alta."
     when ((fault shr 4) and 0x3) {

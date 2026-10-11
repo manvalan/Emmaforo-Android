@@ -40,6 +40,8 @@ class BleLink(
     private val safeUuid = uuid("FFFC")
     private val presetUuid = uuid("FFFD")
     private val serialUuid = uuid("FFFE")
+    private val firmwareVersionUuid = uuid("FFEF")
+    private val firmwareApproveUuid = uuid("FFEE")
     private val cccd = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     var ready: Boolean = false
@@ -210,6 +212,29 @@ class BleLink(
         enqueue(characteristic, text.toByteArray(Charsets.UTF_8), "power")
     }
 
+    fun approveFirmware(version: String): Boolean {
+        val characteristic = chars[firmwareApproveUuid] ?: return false
+        if (!ready) return false
+        enqueue(characteristic, version.toByteArray(Charsets.UTF_8), "firmware")
+        return true
+    }
+
+    /** Lets go of the lamp so a 1.0 board keeps Wi-Fi up for the download. */
+    @SuppressLint("MissingPermission")
+    fun release() {
+        yielding = true
+        stopScan()
+        val link = gatt
+        if (link == null) {
+            yielding = false
+            return
+        }
+        try {
+            link.disconnect()
+        } catch (_: SecurityException) {
+        }
+    }
+
     fun readPower() {
         chars[batteryUuid]?.let { enqueueRead(it) }
         chars[safeUuid]?.let { enqueueRead(it) }
@@ -325,6 +350,7 @@ class BleLink(
             "apply" -> session.noteStatus("Rete salvata sulla scheda")
             "preset" -> session.ackPreset()
             "led" -> finishLamp(true)
+            "firmware" -> session.onFirmwareApproved()
         }
     }
 
@@ -336,6 +362,7 @@ class BleLink(
             }
             "net", "apply" -> session.noteStatus("Errore invio rete")
             "scan" -> session.onScanFinished(emptyList(), "Errore scansione reti")
+            "firmware" -> session.onFirmwareApproveFailed()
         }
     }
 
@@ -485,7 +512,7 @@ class BleLink(
         listOf(scanResultsUuid, batteryUuid, networkUuid).forEach { id ->
             chars[id]?.let { armNotify(it) }
         }
-        listOf(batteryUuid, networkUuid, nameUuid, serialUuid, presetUuid, safeUuid).forEach { id ->
+        listOf(batteryUuid, networkUuid, nameUuid, serialUuid, firmwareVersionUuid, presetUuid, safeUuid).forEach { id ->
             chars[id]?.let { enqueueRead(it) }
         }
         if (session.scanWhenReady) {
@@ -514,6 +541,7 @@ class BleLink(
         applyUuid -> "apply"
         presetUuid -> "preset"
         scanRequestUuid -> "scan"
+        firmwareApproveUuid -> "firmware"
         else -> "other"
     }
 
@@ -524,6 +552,7 @@ class BleLink(
             networkUuid -> session.applyNetwork(text)
             nameUuid -> session.applyName(text.trim())
             serialUuid -> session.applySerial(text.trim())
+            firmwareVersionUuid -> session.applyFirmwareVersion(text.trim())
             presetUuid -> if (value.size == 25) session.applyPreset(value)
             safeUuid -> if (value.isNotEmpty()) session.applySafe(value[0].toInt() != 0)
             scanResultsUuid -> ingestScan(text)

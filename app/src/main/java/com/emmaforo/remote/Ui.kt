@@ -145,6 +145,22 @@ fun EmmaforoScreen(session: LampSession) {
             }
         }
     }
+    if (session.confirmFirmware) {
+        AlertDialog(
+            onDismissRequest = { session.confirmFirmware = false },
+            title = { Text("Aggiornare il firmware?") },
+            text = { Text("La scheda accende il Wi‑Fi solo per scaricare questa versione sulla rete salvata, si riavvia e lo spegne di nuovo.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    session.confirmFirmware = false
+                    session.approveFirmware()
+                }) { Text("Aggiorna") }
+            },
+            dismissButton = {
+                TextButton(onClick = { session.confirmFirmware = false }) { Text("Annulla") }
+            },
+        )
+    }
     if (session.confirmRest) {
         AlertDialog(
             onDismissRequest = { session.confirmRest = false },
@@ -259,6 +275,26 @@ private fun InfoPage(session: LampSession) {
             Text(session.chargerLine, color = quiet, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
             InfoRow("Colori", "${session.savedColorCount} di 8")
             InfoRow("Numero di serie", if (session.serialNumber.isEmpty()) "—" else session.serialNumber, mono = true)
+            InfoRow("Firmware", session.firmwareVersion.ifEmpty { "—" }, mono = true)
+            if (session.firmwareUpdating) {
+                Text("Firmware in aggiornamento: la lampada lo scarica via Wi‑Fi e si riavvia.", color = quiet, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+            }
+            val result = session.firmwareResult
+            if (result != null && !session.firmwareUpdating) {
+                Text(result, color = quiet, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+            }
+            val newer = session.newerFirmware
+            if (newer != null && !session.firmwareUpdating) {
+                Text("È disponibile il firmware $newer in emmaforo.michelebigi.it/firmware.", color = ink, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+                if (session.updateNeedsNetwork) {
+                    Text("Per aggiornare, salva prima una rete Wi‑Fi in Configurazione: la lampada la usa solo per scaricare il firmware.", color = quiet, modifier = Modifier.padding(horizontal = 16.dp))
+                }
+                TextButton(
+                    onClick = { session.confirmFirmware = true },
+                    enabled = session.ready && !session.updateNeedsNetwork,
+                    modifier = Modifier.padding(horizontal = 8.dp),
+                ) { Text("Aggiorna") }
+            }
             TextButton(
                 onClick = { session.confirmRest = true },
                 enabled = session.ready && !session.resting,
@@ -422,7 +458,7 @@ private fun ConfigPage(session: LampSession) {
         if (session.connectedNetworkName.isNotEmpty()) {
             Text("Sulla scheda: ${session.connectedNetworkName}", color = quiet, fontSize = 13.sp)
         }
-        Text("Si imposta una volta. Resta sulla scheda anche dopo lo spegnimento.", color = quiet, fontSize = 13.sp)
+        Text("Serve solo per scaricare un firmware nuovo che hai approvato: per tutto il resto la lampada usa il Bluetooth e tiene il Wi‑Fi spento. Si imposta una volta e resta sulla scheda.", color = quiet, fontSize = 13.sp)
         val networkStatus = session.status
         if (networkStatus == "Salvo la rete…" || networkStatus == "Rete salvata sulla scheda" || networkStatus == "Errore invio rete") {
             Text(networkStatus, color = quiet, fontSize = 13.sp)
@@ -455,7 +491,7 @@ private fun ConfigPage(session: LampSession) {
                 FilterChip(selected = !session.gentleCharge, onClick = { session.setGentle(false) }, label = { Text("Normale") }, enabled = session.ready)
             }
         }
-        Text("Ricarica sicura: pausa al 95%, riprende al 20%.", color = quiet, fontSize = 13.sp, modifier = Modifier.padding(start = 12.dp))
+        Text("La batteria si ferma sempre al 100%, che è il 95% della sua capacità. Ricarica sicura: resta intorno al 90% e sotto l'80% riprende con una ricarica molto gentile.", color = quiet, fontSize = 13.sp, modifier = Modifier.padding(start = 12.dp))
     }
 }
 
