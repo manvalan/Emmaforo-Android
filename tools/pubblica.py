@@ -2,6 +2,7 @@
 """Pubblica su emmaforo.michelebigi.it l'app Android, le pagine del sito e il firmware.
 
     python tools/pubblica.py app                       # build release firmata + pagine + APK
+    python tools/pubblica.py app --apk release/emmaforo-1.2.apk   # APK già firmato (per esempio dal Mac)
     python tools/pubblica.py sito                      # solo le pagine (site/)
     python tools/pubblica.py firmware emmaforo.bin 1.2 # firmware e nota di versione
     python tools/pubblica.py ... --prova               # mostra cosa caricherebbe, senza caricare
@@ -153,12 +154,15 @@ def main():
     parser.add_argument("cosa", choices=["app", "sito", "firmware"])
     parser.add_argument("binario", nargs="?", help="per firmware: il file .bin")
     parser.add_argument("versione", nargs="?", help="per firmware: la versione, per esempio 1.2")
+    parser.add_argument("--apk", help="per app: carica questo APK già firmato invece di compilare")
     parser.add_argument("--prova", action="store_true", help="mostra i file senza caricarli")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as scratch:
         if args.cosa == "app":
-            if not args.prova:
+            if args.apk:
+                shutil.copyfile(args.apk, SITE / "app" / "emmaforo.apk")
+            elif not args.prova:
                 build_release()
             files = site_files(with_apk=True)
         elif args.cosa == "sito":
