@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Emmaforo · App</title>
+  <script>
+    // One link (and one QR) for both phones: iPhone goes to the App Store, Android downloads the APK.
+    var ua = navigator.userAgent || "";
+    var apple = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && "ontouchend" in document);
+    if (apple) location.replace("https://apps.apple.com/it/app/emmaforo/id6817870513");
+    else if (/Android/.test(ua)) location.replace("/app/emmaforo.apk");
+    else location.replace("/#app");
+  </script>
+</head>
+<body>
+  <p><a href="/#app">Scarica l'app Emmaforo</a></p>
+</body>
+</html>

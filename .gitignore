@@ -11,3 +11,6 @@ captures/
 *.keystore
 *.jks
 *.apk
+keystore.properties
+pubblica.ini
+site/app/emmaforo.apk
