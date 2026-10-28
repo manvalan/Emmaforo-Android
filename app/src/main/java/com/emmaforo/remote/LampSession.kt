@@ -562,6 +562,14 @@ class LampSession(private val app: Context) {
         main.postDelayed({ ble.readChain() }, 800)
     }
 
+    fun refreshChain() {
+        if (ready) ble.readChain()
+    }
+
+    fun refreshAudio() {
+        if (ready) ble.readAudio()
+    }
+
     fun stopChain() {
         playingChainId = null
         ble.writeChain(byteArrayOf(0))
