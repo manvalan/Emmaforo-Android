@@ -44,6 +44,74 @@ class LampStore(context: Context) {
         prefs.edit().putString("slots", encodeSlots(slots)).apply()
     }
 
+    fun loadChains(): List<ColorChain> {
+        val raw = prefs.getString("chains", null) ?: return emptyList()
+        return try {
+            val array = JSONArray(raw)
+            (0 until array.length()).map { index ->
+                val item = array.getJSONObject(index)
+                val steps = item.optJSONArray("steps") ?: JSONArray()
+                ColorChain(
+                    id = item.optString("id", java.util.UUID.randomUUID().toString()),
+                    name = item.optString("name", ""),
+                    loop = item.optBoolean("loop", true),
+                    steps = (0 until steps.length()).map { at ->
+                        val step = steps.getJSONObject(at)
+                        ChainStep(
+                            id = step.optString("id", java.util.UUID.randomUUID().toString()),
+                            red = step.optDouble("r", 0.0).toFloat(),
+                            green = step.optDouble("g", 0.0).toFloat(),
+                            blue = step.optDouble("b", 0.0).toFloat(),
+                            fadeTenths = step.optInt("fade", 10),
+                            holdTenths = step.optInt("hold", 30),
+                            sound = step.optInt("sound", 0),
+                        )
+                    },
+                )
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun saveChains(chains: List<ColorChain>) {
+        val array = JSONArray()
+        chains.forEach { chain ->
+            val steps = JSONArray()
+            chain.steps.forEach { step ->
+                steps.put(
+                    JSONObject()
+                        .put("id", step.id)
+                        .put("r", step.red.toDouble())
+                        .put("g", step.green.toDouble())
+                        .put("b", step.blue.toDouble())
+                        .put("fade", step.fadeTenths)
+                        .put("hold", step.holdTenths)
+                        .put("sound", step.sound)
+                )
+            }
+            array.put(JSONObject().put("id", chain.id).put("name", chain.name).put("loop", chain.loop).put("steps", steps))
+        }
+        prefs.edit().putString("chains", array.toString()).apply()
+    }
+
+    /** The sentence written in each voice slot; the firmware keeps only the samples. */
+    fun loadPhrases(): List<String> {
+        val raw = prefs.getString("phrases", null) ?: return defaultPhrases
+        return try {
+            val array = JSONArray(raw)
+            List(voiceSlotCount) { index -> if (index < array.length()) array.optString(index, "") else "" }
+        } catch (_: Exception) {
+            defaultPhrases
+        }
+    }
+
+    fun savePhrases(phrases: List<String>) {
+        val array = JSONArray()
+        phrases.take(voiceSlotCount).forEach { array.put(it) }
+        prefs.edit().putString("phrases", array.toString()).apply()
+    }
+
     private fun encodeSlots(slots: List<SlotColor?>): String {
         val array = JSONArray()
         padded(slots).forEach { slot ->

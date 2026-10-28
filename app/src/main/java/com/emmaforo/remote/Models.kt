@@ -97,3 +97,116 @@ fun chargerNotice(
     if (fault and 0x80 != 0) return "Il timer di controllo del caricatore è scaduto."
     return "Registro guasti del caricatore, valore $fault."
 }
+
+/** One step of a chain: fade to the colour in [fadeTenths], stay [holdTenths], play [sound] on arrival. */
+data class ChainStep(
+    val id: String = UUID.randomUUID().toString(),
+    val red: Float,
+    val green: Float,
+    val blue: Float,
+    val fadeTenths: Int = 10,
+    val holdTenths: Int = 30,
+    val sound: Int = 0,
+) {
+    val color: Color get() = Color(red, green, blue)
+}
+
+data class ColorChain(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String,
+    val loop: Boolean = true,
+    val steps: List<ChainStep> = emptyList(),
+) {
+    val totalTenths: Int get() = steps.sumOf { it.fadeTenths + it.holdTenths }
+    val playable: Boolean get() = steps.isNotEmpty() && !(loop && totalTenths == 0)
+}
+
+/** What the lamp reports on FFEB. */
+data class ChainState(val active: Boolean, val step: Int, val loop: Boolean, val steps: List<ChainStep>)
+
+/** A sound number as the firmware knows it: 0 none, 1-5 built in, 16-20 voice slots 0-4. */
+data class LampSound(val number: Int, val label: String)
+
+const val chainStepLimit = 16
+const val chainTenthsLimit = 65_535
+const val voiceSlotCount = 5
+const val firstVoiceSound = 16
+
+val builtInSounds = listOf(
+    LampSound(0, "Nessuno"),
+    LampSound(1, "Bip"),
+    LampSound(2, "Doppio bip"),
+    LampSound(3, "Din-don"),
+    LampSound(4, "Allarme"),
+    LampSound(5, "Melodia"),
+)
+
+/** The lamp states that each have a sound, in the order FFEA reads them. */
+val soundStates = listOf("rosso" to "Rosso", "giallo" to "Giallo", "verde" to "Verde", "spento" to "Spento", "altro" to "Altri colori")
+
+/** Suggested sentences for the voice slots, the first three tied to the traffic-light colours. */
+val defaultPhrases = listOf("Stop", "Attenzione", "Avanti", "", "")
+
+fun stepFromCommand(command: String): ChainStep {
+    val color = commandColor(command)
+    return ChainStep(red = color.red, green = color.green, blue = color.blue)
+}
+
+fun commandColor(command: String): Color {
+    lampPalette.firstOrNull { it.command == command || it.id == command }?.let { return it.color }
+    if (command.length == 7 && command.startsWith("#")) {
+        val value = command.substring(1).toIntOrNull(16) ?: return Color.Gray
+        return Color(((value shr 16) and 0xFF) / 255f, ((value shr 8) and 0xFF) / 255f, (value and 0xFF) / 255f)
+    }
+    return Color.Gray
+}
+
+fun tenthsText(tenths: Int): String {
+    val seconds = tenths / 10
+    val rest = tenths % 10
+    return if (seconds >= 60) "${seconds / 60} min ${seconds % 60} s" else if (rest == 0) "$seconds s" else "$seconds,$rest s"
+}
+
+private fun channelByte(value: Float): Byte = (value.coerceIn(0f, 1f) * 255f).roundToInt().coerceIn(0, 255).toByte()
+
+/** FFEB write `01 flags n` then 8 bytes a step: r g b, u16 fade, u16 hold (tenths of a second), sound. */
+fun chainBytes(chain: ColorChain): ByteArray {
+    val steps = chain.steps.take(chainStepLimit)
+    val bytes = ByteArray(3 + steps.size * 8)
+    bytes[0] = 1
+    bytes[1] = if (chain.loop) 1 else 0
+    bytes[2] = steps.size.toByte()
+    steps.forEachIndexed { index, step ->
+        val at = 3 + index * 8
+        bytes[at] = channelByte(step.red)
+        bytes[at + 1] = channelByte(step.green)
+        bytes[at + 2] = channelByte(step.blue)
+        val fade = step.fadeTenths.coerceIn(0, chainTenthsLimit)
+        val hold = step.holdTenths.coerceIn(0, chainTenthsLimit)
+        bytes[at + 3] = (fade and 0xFF).toByte()
+        bytes[at + 4] = (fade shr 8).toByte()
+        bytes[at + 5] = (hold and 0xFF).toByte()
+        bytes[at + 6] = (hold shr 8).toByte()
+        bytes[at + 7] = step.sound.coerceIn(0, 255).toByte()
+    }
+    return bytes
+}
+
+/** FFEB read: `active step flags n` and the steps. */
+fun decodeChainState(data: ByteArray): ChainState? {
+    if (data.size < 4) return null
+    fun u8(index: Int) = data[index].toInt() and 0xFF
+    val count = u8(3).coerceAtMost((data.size - 4) / 8)
+    val steps = (0 until count).map { index ->
+        val at = 4 + index * 8
+        ChainStep(
+            red = u8(at) / 255f,
+            green = u8(at + 1) / 255f,
+            blue = u8(at + 2) / 255f,
+            fadeTenths = u8(at + 3) or (u8(at + 4) shl 8),
+            holdTenths = u8(at + 5) or (u8(at + 6) shl 8),
+            sound = u8(at + 7),
+        )
+    }
+    return ChainState(active = u8(0) != 0, step = u8(1), loop = u8(2) and 1 != 0, steps = steps)
+}

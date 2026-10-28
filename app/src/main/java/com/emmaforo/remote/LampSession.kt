@@ -103,6 +103,44 @@ class LampSession(private val app: Context) {
     private var firmwareNoteFetchedAt = 0L
     private var firmwareReconnect: Runnable? = null
     var tab by mutableIntStateOf(0)
+    var chain by mutableStateOf(ColorChain(name = "Catena"))
+        private set
+    var chainState by mutableStateOf<ChainState?>(null)
+        private set
+    var playingChainId by mutableStateOf<String?>(null)
+        private set
+    var chainsAvailable by mutableStateOf(false)
+        private set
+    var audioAvailable by mutableStateOf(false)
+        private set
+    var volume by mutableFloatStateOf(70f)
+    var stateSounds by mutableStateOf(List(soundStates.size) { 0 })
+        private set
+    var voiceMask by mutableIntStateOf(0)
+        private set
+    var voiceMaxMs by mutableIntStateOf(3000)
+        private set
+    var voicePartition by mutableStateOf(false)
+        private set
+    var phrases by mutableStateOf(List(voiceSlotCount) { "" })
+        private set
+    var clipSlot by mutableStateOf<Int?>(null)
+        private set
+    var clipProgress by mutableFloatStateOf(0f)
+        private set
+    var clipNote by mutableStateOf<String?>(null)
+        private set
+    var voiceNote by mutableStateOf<String?>(null)
+        private set
+    var configPage by mutableIntStateOf(0)
+    var listening by mutableStateOf(false)
+        private set
+    private val synth = PhraseSynth(app)
+    private val listener = VoiceListener(app) { guesses -> handleVoice(guesses) }.also { voice ->
+        voice.onListening = { listening = it }
+    }
+    private var clipWrites = 0
+    private var clipDone = 0
     private var editingSlotId: String? = null
     private var lastBlink = false
     private var pending: Pair<String, Boolean>? = null
@@ -134,6 +172,8 @@ class LampSession(private val app: Context) {
         blink = store.lampBlink
         lastBlink = blink
         slots = store.loadSlots()
+        chain = store.loadChains().firstOrNull() ?: defaultChain()
+        phrases = store.loadPhrases()
         val color = store.lampColor
         if (store.lampOn && color.isNotEmpty()) {
             lastCommand = color
@@ -197,6 +237,8 @@ class LampSession(private val app: Context) {
             searchTimeout?.let { main.removeCallbacks(it) }
             outOfRange = false
             status = "Connesso"
+            chainsAvailable = ble.hasChains
+            audioAvailable = ble.hasAudio
             pending?.let { (command, blinkOn) ->
                 pending = null
                 ble.setLed(command, blinkOn, brightnessByte())
@@ -214,6 +256,8 @@ class LampSession(private val app: Context) {
 
     fun onDropped() {
         ready = false
+        chainsAvailable = false
+        audioAvailable = false
         scanningNetworks = false
         hasWifiStatus = false
         if (!connectionRequested) return
@@ -368,6 +412,209 @@ class LampSession(private val app: Context) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return null
         return trimmed.split('.').map { piece -> piece.toIntOrNull() ?: return null }
+    }
+
+    fun applyChainState(data: ByteArray) {
+        val state = decodeChainState(data) ?: return
+        chainState = state
+        if (!state.active) playingChainId = null
+    }
+
+    /** FFEA read: `1\tvolume\tr,g,v,s,a\tvoice mask\tms per voice\tpartition`. */
+    fun applyAudio(text: String) {
+        val fields = text.trim().split('\t')
+        if (fields.size < 3 || fields[0] != "1") return
+        fields[1].toIntOrNull()?.let { volume = it.coerceIn(0, 100).toFloat() }
+        val map = fields[2].split(',').mapNotNull { it.toIntOrNull() }
+        if (map.size == soundStates.size) stateSounds = map
+        voiceMask = fields.getOrNull(3)?.toIntOrNull() ?: 0
+        voiceMaxMs = fields.getOrNull(4)?.toIntOrNull() ?: voiceMaxMs
+        voicePartition = fields.getOrNull(5) == "1"
+    }
+
+    val soundChoices: List<LampSound>
+        get() = builtInSounds + if (!voicePartition) emptyList() else (0 until voiceSlotCount).map { slot ->
+            val text = phrases.getOrNull(slot).orEmpty()
+            val label = if (text.isNotBlank()) "“${text.trim()}”" else "Messaggio ${slot + 1}"
+            LampSound(firstVoiceSound + slot, label)
+        }
+
+    fun soundLabel(number: Int): String = soundChoices.firstOrNull { it.number == number }?.label ?: "Suono $number"
+
+    fun changeVolume(value: Float) {
+        volume = ((value / 5f).roundToInt() * 5f).coerceIn(0f, 100f)
+    }
+
+    /** Written when the slider is let go, like the iOS app. */
+    fun commitVolume() {
+        ble.audioCommand("vol:${volume.roundToInt()}")
+    }
+
+    fun setStateSound(index: Int, number: Int) {
+        val state = soundStates.getOrNull(index)?.first ?: return
+        if (!ble.audioCommand("map:$state:$number")) {
+            status = "Collega prima EmmaForo"
+            return
+        }
+        stateSounds = stateSounds.toMutableList().also { it[index] = number }
+    }
+
+    fun playSound(number: Int) {
+        if (number == 0) return
+        if (!ble.audioCommand("play:$number")) status = "Collega prima EmmaForo"
+    }
+
+    fun changePhrase(slot: Int, text: String) {
+        if (slot !in 0 until voiceSlotCount) return
+        phrases = phrases.toMutableList().also { it[slot] = text }
+        store.savePhrases(phrases)
+    }
+
+    fun previewPhrase(slot: Int) {
+        val text = phrases.getOrNull(slot)?.trim().orEmpty()
+        if (text.isEmpty()) return
+        scope.launch { synth.preview(text) }
+    }
+
+    /** Synthesises the sentence on the phone and writes it into the lamp's voice slot. */
+    fun sendPhrase(slot: Int) {
+        val text = phrases.getOrNull(slot)?.trim().orEmpty()
+        if (text.isEmpty() || clipSlot != null) return
+        if (!ready || !audioAvailable) {
+            clipNote = "Collega prima EmmaForo"
+            return
+        }
+        clipSlot = slot
+        clipProgress = 0f
+        clipNote = "Preparo la voce…"
+        scope.launch {
+            val maxBytes = (voiceMaxMs.toLong() * lampSampleRate / 1000).toInt().coerceIn(1, 24_576)
+            val samples = synth.render(text, maxBytes)
+            if (samples == null) {
+                clipSlot = null
+                clipNote = "Il telefono non ha potuto sintetizzare la frase. Controlla la sintesi vocale nelle impostazioni di Android."
+                return@launch
+            }
+            clipDone = 0
+            clipWrites = ble.uploadClip(slot, samples)
+            if (clipWrites == 0) {
+                clipSlot = null
+                clipNote = "Collega prima EmmaForo"
+                return@launch
+            }
+            clipNote = "Invio alla lampada…"
+        }
+    }
+
+    fun deletePhrase(slot: Int) {
+        if (ble.audioCommand("clip:del:$slot")) {
+            voiceMask = voiceMask and (1 shl slot).inv()
+            ble.readAudio()
+        }
+    }
+
+    fun onClipProgress() {
+        clipDone += 1
+        if (clipWrites > 0) clipProgress = clipDone / clipWrites.toFloat()
+    }
+
+    fun onClipSaved() {
+        val slot = clipSlot
+        clipSlot = null
+        clipProgress = 1f
+        if (slot != null) voiceMask = voiceMask or (1 shl slot)
+        clipNote = "Frase salvata sulla lampada."
+        // Messages 1-3 are for red, yellow and green: give a silent state its message, as on iOS.
+        if (slot != null && slot < 3 && stateSounds.getOrElse(slot) { -1 } == 0) {
+            setStateSound(slot, firstVoiceSound + slot)
+        }
+    }
+
+    fun onClipFailed() {
+        clipSlot = null
+        clipNote = "La lampada non ha accettato la frase. Riprova."
+    }
+
+    private fun defaultChain() = ColorChain(
+        name = "Catena",
+        steps = listOf(stepFromCommand("verde"), stepFromCommand("giallo"), stepFromCommand("rosso")),
+    )
+
+    /** The steps stay on the phone, like the iOS app; the lamp keeps the last chain it was sent. */
+    fun updateChain(updated: ColorChain) {
+        chain = updated.copy(steps = updated.steps.take(chainStepLimit))
+        store.saveChains(listOf(chain))
+    }
+
+    fun playChain() {
+        if (!chain.playable) {
+            status = "Con Ripeti serve almeno un passo con una durata"
+            return
+        }
+        if (!ble.writeChain(chainBytes(chain))) {
+            status = "Collega prima EmmaForo"
+            return
+        }
+        if (resting) resting = false
+        playingChainId = chain.id
+        clearSelection()
+        lastCommand = null
+        main.postDelayed({ ble.readChain() }, 800)
+    }
+
+    fun stopChain() {
+        playingChainId = null
+        ble.writeChain(byteArrayOf(0))
+        main.postDelayed({ ble.readChain() }, 800)
+    }
+
+    fun recordPermission(): Boolean =
+        ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    fun listen() {
+        if (listening) {
+            listener.stop()
+            return
+        }
+        if (!listener.available()) {
+            voiceNote = "Il telefono non ha il riconoscimento vocale"
+            return
+        }
+        voiceNote = null
+        listener.start()
+    }
+
+    /** Recognised speech from the phone's microphone. */
+    fun handleVoice(guesses: List<String>) {
+        when (val action = parseVoice(guesses)) {
+            null -> voiceNote = voiceHelp
+            is VoiceAction.Light -> {
+                if (resting) resting = false
+                action.blink?.let { blink = it }
+                focusCommand(action.command)
+                sendLight(action.command, blink)
+                voiceNote = action.name
+            }
+            is VoiceAction.Blink -> {
+                blink = action.on
+                val command = lastCommand
+                if (lampIsOn && command != null) sendLight(command, blink)
+                voiceNote = if (action.on) "Lampeggia" else "Fisso"
+            }
+            VoiceAction.Off -> {
+                clearSelection()
+                sendLight("spento", false)
+                voiceNote = "Spento"
+            }
+            VoiceAction.StartChain -> {
+                playChain()
+                voiceNote = "Catena avviata"
+            }
+            VoiceAction.StopChain -> {
+                stopChain()
+                voiceNote = "Catena fermata"
+            }
+        }
     }
 
     fun applySafe(enabled: Boolean) {
@@ -573,7 +820,11 @@ class LampSession(private val app: Context) {
     }
 
     fun openPowerTab() {
-        if (ready) ble.readPower()
+        if (ready) {
+            ble.readPower()
+            ble.readAudio()
+            ble.readChain()
+        }
         refreshFirmwareNote()
     }
 
@@ -732,6 +983,8 @@ class LampSession(private val app: Context) {
     private fun brightnessByte(): Int = (level.coerceIn(0f, 100f) / 100f * 255f).roundToInt()
 
     private fun sendLight(command: String, blinkOn: Boolean) {
+        // Any light command stops a running chain on the lamp.
+        playingChainId = null
         lastCommand = command
         if (command != "spento") lastBlink = blinkOn
         val on = command != "spento"

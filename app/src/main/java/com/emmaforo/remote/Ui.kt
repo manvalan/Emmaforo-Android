@@ -83,8 +83,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private val page = Color(0xFFF2F2F7)
-private val ink = Color(0xFF111111)
-private val quiet = Color(0xFF8E8E93)
+internal val ink = Color(0xFF111111)
+internal val quiet = Color(0xFF8E8E93)
+internal val danger = Color(0xFFB00020)
 
 @Composable
 fun EmmaforoScreen(session: LampSession) {
@@ -126,6 +127,7 @@ fun EmmaforoScreen(session: LampSession) {
                     NavigationBarItem(
                         selected = session.tab == 3,
                         onClick = {
+                            if (session.tab == 3) session.configPage = 0
                             session.tab = 3
                             session.openPowerTab()
                         },
@@ -140,7 +142,11 @@ fun EmmaforoScreen(session: LampSession) {
                     0 -> SemaphorePage(session, permissionLauncher::launch)
                     1 -> InfoPage(session)
                     2 -> ColorsPage(session)
-                    else -> ConfigPage(session)
+                    else -> when (session.configPage) {
+                        1 -> ChainPage(session)
+                        2 -> SoundsPage(session)
+                        else -> ConfigPage(session)
+                    }
                 }
             }
         }
@@ -241,7 +247,12 @@ private fun SemaphorePage(session: LampSession, askPermission: (Array<String>) -
                     )
                 }
             }
-            Spacer(Modifier.height(36.dp))
+            Spacer(Modifier.height(16.dp))
+            VoiceButton(session, Modifier.align(Alignment.CenterHorizontally))
+            session.voiceNote?.let {
+                Text(it, color = quiet, fontSize = 13.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
+            }
+            Spacer(Modifier.height(16.dp))
             Text("Intensità luminosa", color = ink)
             Slider(
                 value = session.level,
@@ -410,6 +421,7 @@ private fun ConfigPage(session: LampSession) {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        LampSection(session)
         Text("Wi‑Fi", color = quiet, fontSize = 13.sp, modifier = Modifier.padding(start = 12.dp))
         FormCard {
             InfoRow("Rete salvata", if (!session.hasWifiStatus) "—" else session.savedNetwork)
@@ -496,7 +508,7 @@ private fun ConfigPage(session: LampSession) {
 }
 
 @Composable
-private fun FormCard(content: @Composable () -> Unit) {
+internal fun FormCard(content: @Composable () -> Unit) {
     Column(
         Modifier
             .fillMaxWidth()
@@ -515,7 +527,7 @@ private fun InfoRow(label: String, value: String, mono: Boolean = false) {
 }
 
 @Composable
-private fun ColorDisc(
+internal fun ColorDisc(
     color: Color,
     filled: Boolean,
     blinking: Boolean,

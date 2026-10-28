@@ -42,6 +42,9 @@ class BleLink(
     private val serialUuid = uuid("FFFE")
     private val firmwareVersionUuid = uuid("FFEF")
     private val firmwareApproveUuid = uuid("FFEE")
+    private val chainUuid = uuid("FFEB")
+    private val audioUuid = uuid("FFEA")
+    private val clipUuid = uuid("FFE9")
     private val cccd = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     var ready: Boolean = false
@@ -65,6 +68,11 @@ class BleLink(
     private var queuedLamp: Triple<String, Boolean, Int>? = null
     private var lampTimeout: Runnable? = null
     private var setupDone = false
+    private var currentKind = "other"
+    private var mtu = 23
+
+    val hasChains: Boolean get() = ready && chars[chainUuid] != null
+    val hasAudio: Boolean get() = ready && chars[audioUuid] != null
 
     private sealed class Op {
         class Write(val characteristic: BluetoothGattCharacteristic, val value: ByteArray, val kind: String) : Op()
@@ -219,6 +227,59 @@ class BleLink(
         return true
     }
 
+    /** Sends a chain (or stops the lamp's chain when [bytes] is `00`). */
+    fun writeChain(bytes: ByteArray): Boolean {
+        val characteristic = chars[chainUuid] ?: return false
+        if (!ready) return false
+        queue.removeAll { it is Op.Write && it.kind == "chain" }
+        enqueue(characteristic, bytes, "chain")
+        return true
+    }
+
+    fun readChain() {
+        chars[chainUuid]?.let { if (ready) enqueueRead(it) }
+    }
+
+    fun audioCommand(text: String): Boolean {
+        val characteristic = chars[audioUuid] ?: return false
+        if (!ready) return false
+        enqueue(characteristic, text.toByteArray(Charsets.UTF_8), "audio")
+        return true
+    }
+
+    fun readAudio() {
+        chars[audioUuid]?.let { if (ready) enqueueRead(it) }
+    }
+
+    /** Writes a voice message into [slot]: begin, the samples in chunks that fit the MTU, end with the CRC. */
+    fun uploadClip(slot: Int, samples: ByteArray): Int {
+        val control = chars[audioUuid] ?: return 0
+        val data = chars[clipUuid] ?: return 0
+        if (!ready || samples.isEmpty()) return 0
+        queue.removeAll { it is Op.Write && (it.kind == "clip" || it.kind == "clipEnd") }
+        val crc = java.util.zip.CRC32().apply { update(samples) }.value
+        enqueue(control, "clip:begin:$slot:${samples.size}".toByteArray(Charsets.UTF_8), "clip")
+        val chunk = (mtu - 3 - 4).coerceIn(16, 512)
+        var offset = 0
+        var writes = 1
+        while (offset < samples.size) {
+            val count = minOf(chunk, samples.size - offset)
+            val packet = ByteArray(4 + count)
+            packet[0] = (offset and 0xFF).toByte()
+            packet[1] = ((offset shr 8) and 0xFF).toByte()
+            packet[2] = ((offset shr 16) and 0xFF).toByte()
+            packet[3] = ((offset shr 24) and 0xFF).toByte()
+            System.arraycopy(samples, offset, packet, 4, count)
+            queue.add(Op.Write(data, packet, "clip"))
+            offset += count
+            writes += 1
+        }
+        queue.add(Op.Write(control, "clip:end:$slot:${String.format("%08x", crc)}".toByteArray(Charsets.UTF_8), "clipEnd"))
+        queue.add(Op.Read(control))
+        pump()
+        return writes
+    }
+
     /** Lets go of the lamp so a 1.0 board keeps Wi-Fi up for the download. */
     @SuppressLint("MissingPermission")
     fun release() {
@@ -298,6 +359,7 @@ class BleLink(
     private fun writeNow(characteristic: BluetoothGattCharacteristic, value: ByteArray, kind: String) {
         val link = gatt ?: return
         writing = true
+        currentKind = kind
         val type = if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         } else {
@@ -351,6 +413,8 @@ class BleLink(
             "preset" -> session.ackPreset()
             "led" -> finishLamp(true)
             "firmware" -> session.onFirmwareApproved()
+            "clip" -> session.onClipProgress()
+            "clipEnd" -> session.onClipSaved()
         }
     }
 
@@ -363,6 +427,12 @@ class BleLink(
             "net", "apply" -> session.noteStatus("Errore invio rete")
             "scan" -> session.onScanFinished(emptyList(), "Errore scansione reti")
             "firmware" -> session.onFirmwareApproveFailed()
+            "chain" -> session.noteStatus("La lampada ha rifiutato la catena")
+            "audio" -> session.noteStatus("Errore comando audio")
+            "clip", "clipEnd" -> {
+                queue.removeAll { it is Op.Write && (it.kind == "clip" || it.kind == "clipEnd") }
+                session.onClipFailed()
+            }
         }
     }
 
@@ -424,7 +494,10 @@ class BleLink(
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            main.post { continueSetup() }
+            main.post {
+                if (status == BluetoothGatt.GATT_SUCCESS) this@BleLink.mtu = mtu
+                continueSetup()
+            }
         }
 
         @SuppressLint("MissingPermission")
@@ -453,7 +526,7 @@ class BleLink(
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
             main.post {
                 writing = false
-                val kind = kindFor(characteristic.uuid)
+                val kind = currentKind
                 if (status == BluetoothGatt.GATT_SUCCESS) succeed(kind) else fail(kind)
                 pump()
             }
@@ -512,7 +585,7 @@ class BleLink(
         listOf(scanResultsUuid, batteryUuid, networkUuid).forEach { id ->
             chars[id]?.let { armNotify(it) }
         }
-        listOf(batteryUuid, networkUuid, nameUuid, serialUuid, firmwareVersionUuid, presetUuid, safeUuid).forEach { id ->
+        listOf(batteryUuid, networkUuid, nameUuid, serialUuid, firmwareVersionUuid, presetUuid, safeUuid, chainUuid, audioUuid).forEach { id ->
             chars[id]?.let { enqueueRead(it) }
         }
         if (session.scanWhenReady) {
@@ -535,15 +608,6 @@ class BleLink(
         queue.add(Op.Descriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE))
     }
 
-    private fun kindFor(id: UUID): String = when (id) {
-        ledUuid -> "led"
-        ssidUuid, passwordUuid -> "net"
-        applyUuid -> "apply"
-        presetUuid -> "preset"
-        scanRequestUuid -> "scan"
-        firmwareApproveUuid -> "firmware"
-        else -> "other"
-    }
 
     private fun ingest(id: UUID, value: ByteArray) {
         val text = value.toString(Charsets.UTF_8)
@@ -554,6 +618,8 @@ class BleLink(
             serialUuid -> session.applySerial(text.trim())
             firmwareVersionUuid -> session.applyFirmwareVersion(text.trim())
             presetUuid -> if (value.size == 25) session.applyPreset(value)
+            chainUuid -> session.applyChainState(value)
+            audioUuid -> session.applyAudio(text)
             safeUuid -> if (value.isNotEmpty()) session.applySafe(value[0].toInt() != 0)
             scanResultsUuid -> ingestScan(text)
         }
@@ -595,6 +661,7 @@ class BleLink(
         queue.clear()
         pendingLed = null
         chars.clear()
+        mtu = 23
         try {
             link.close()
         } catch (_: SecurityException) {
