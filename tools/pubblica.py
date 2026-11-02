@@ -71,6 +71,8 @@ def build_release():
 def site_files(with_apk):
     files = [
         (SITE / "index.html", "index.html"),
+        (SITE / "iscriviti.php", "iscriviti.php"),
+        (SITE / "kickstarter" / "index.html", "kickstarter/index.html"),
         (SITE / "app" / "index.html", "app/index.html"),
         (SITE / "app" / "emmaforo-app-qr.svg", "app/emmaforo-app-qr.svg"),
         (SITE / "app" / "emmaforo-app-qr.png", "app/emmaforo-app-qr.png"),
